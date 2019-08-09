@@ -31,8 +31,8 @@ const DefaultHTTPTimeout = 15 * time.Second
 
 // Names of cookies used to store OpenID Connect request state and nonce.
 const (
-	stateCookie = "vis3-tara-state"
-	nonceCookie = "vis3-tara-nonce"
+	stateCookie = "mysystem-tara-state"
+	nonceCookie = "mysystem-tara-nonce"
 )
 
 // Client is a TARA client.
