@@ -20,9 +20,9 @@ import (
 	"github.com/pkg/errors"
 	"golang.org/x/oauth2"
 
-	"stash.ria.ee/vis3/vis3-common/pkg/confutil"
-	"stash.ria.ee/vis3/vis3-common/pkg/log"
-	"stash.ria.ee/vis3/vis3-sea/internal/session"
+	"confutil"
+	"log"
+	"internal/session"
 )
 
 // DefaultHTTPTimeout is the default roundtrip timeout for requests sent to the
