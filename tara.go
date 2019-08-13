@@ -21,8 +21,6 @@ import (
 	oidc "github.com/coreos/go-oidc"
 	"github.com/pkg/errors"
 	"golang.org/x/oauth2"
-
-	"internal/session"
 )
 
 const (
@@ -52,10 +50,33 @@ type Client interface {
 	//
 	// A returned BadRequestError indicates that r was invalid in some way.
 	// Otherwise it was an internal server or TARA error.
-	AuthenticationResponse(*http.Request) (session.UserData, error)
+	AuthenticationResponse(*http.Request) (IDToken, error)
 
 	// ClearCookies tells the user-agent to drop all cookies set by Client.
 	ClearCookies(http.ResponseWriter)
+}
+
+// IDToken contains claims about the authenticated identity.
+type IDToken struct {
+	Identifier string    `json:"jti"`
+	Issuer     string    `json:"iss"`
+	Audience   string    `json:"aud"`
+	Expires    time.Time `json:"-"` // "exp" converted to time.Time.
+	IssuedAt   time.Time `json:"-"` // "iat" converted to time.Time.
+	NotBefore  time.Time `json:"-"` // "nbf" converted to time.Time.
+	Subject    string    `json:"sub"`
+	Profile    struct {
+		DateOfBirth string `json:"date_of_birth"`
+		GivenName   string `json:"given_name"`
+		FamilyName  string `json:"family_name"`
+	} `json:"profile_attributes"`
+	AMR           []string // Authentication Method Reference.
+	State         string
+	Nonce         string
+	ACR           string // Authentication Context Class Reference.
+	AtHash        string `json:"at_hash"`
+	Email         string
+	EmailVerified bool `json:"email_verified"`
 }
 
 // BadRequestError is returned from AuthenticationResponse if the request sent
@@ -263,7 +284,7 @@ func (c *client) addSecretCookie(w http.ResponseWriter, name string) (value stri
 }
 
 // AuthenticationResponse implements the tara.Client interface.
-func (c *client) AuthenticationResponse(r *http.Request) (session.UserData, error) {
+func (c *client) AuthenticationResponse(r *http.Request) (IDToken, error) {
 	// Although this information was likely already logged by HTTPS
 	// filters, log it separately for TARA auditability purposes.
 	c.logf("received authentication response, host: %s, uri: %s", r.Host, r.RequestURI)
@@ -272,105 +293,95 @@ func (c *client) AuthenticationResponse(r *http.Request) (session.UserData, erro
 	query := r.URL.Query()
 	state := query.Get("state")
 	if state == "" {
-		return session.UserData{}, BadRequestError{errors.New("missing state value")}
+		return IDToken{}, BadRequestError{errors.New("missing state value")}
 	}
 	cookie, err := r.Cookie(c.conf.stateCookie())
 	if err != nil {
-		return session.UserData{}, BadRequestError{errors.New("missing state cookie")}
+		return IDToken{}, BadRequestError{errors.New("missing state cookie")}
 	}
 	if expected := encodeSHA256(cookie.Value); state != expected {
 		c.securityf("attempted CSRF? state: %s, expected: %s", state, expected)
-		return session.UserData{}, BadRequestError{errors.New("state does not match")}
+		return IDToken{}, BadRequestError{errors.New("state does not match")}
 	}
 
 	// Check for failed authentication.
 	if errorCode := query.Get("error"); errorCode != "" {
-		return session.UserData{}, errors.Errorf("authentication failed (%s): %s",
+		return IDToken{}, errors.Errorf("authentication failed (%s): %s",
 			errorCode, query.Get("error_description"))
 	}
 
 	// Exchange authorization code for token containing user data.
 	code := r.URL.Query().Get("code")
 	if code == "" {
-		return session.UserData{}, BadRequestError{errors.New("missing authorization code")}
+		return IDToken{}, BadRequestError{errors.New("missing authorization code")}
 	}
 	if cookie, err = r.Cookie(c.conf.nonceCookie()); err != nil {
-		return session.UserData{}, BadRequestError{errors.New("missing nonce cookie")}
+		return IDToken{}, BadRequestError{errors.New("missing nonce cookie")}
 	}
 	return c.tokenRequest(code, cookie.Value)
 }
 
 type claims struct {
-	Profile struct {
-		GivenName  string `json:"given_name"`
-		FamilyName string `json:"family_name"`
-	} `json:"profile_attributes"`
-	AMR       []string `json:"amr"`
-	NotBefore int64    `json:"nbf"`
+	IDToken
+	NBF int64 // Not provided by go-oidc: convert manually.
 }
 
 // tokenRequest requests user data from the token endpoint.
-func (c *client) tokenRequest(code, nonce string) (session.UserData, error) {
+func (c *client) tokenRequest(code, nonce string) (IDToken, error) {
 	ctx := oidc.ClientContext(context.Background(), c.http)
 
 	// Get token.
 	c.logf("requesting token with code %s", code)
 	token, err := c.oauth.Exchange(ctx, code)
 	if err != nil {
-		return session.UserData{}, errors.Wrap(err, "token request")
+		return IDToken{}, errors.Wrap(err, "token request")
 	}
 	c.logf("received token: %+v", token)
 
 	// Verify token.
 	if tokenType := token.Type(); tokenType != "Bearer" {
-		return session.UserData{}, errors.Errorf("unsupported token type: %s", tokenType)
+		return IDToken{}, errors.Errorf("unsupported token type: %s", tokenType)
 	}
 	idTokenJWT, ok := token.Extra("id_token").(string)
 	if !ok {
-		return session.UserData{}, errors.New("missing id_token")
+		return IDToken{}, errors.New("missing id_token")
 	}
 	c.logf("identity token: %s", idTokenJWT)
 
 	idToken, err := c.verifier.Verify(ctx, idTokenJWT)
 	if err != nil {
-		return session.UserData{}, errors.Wrap(err, "verify token")
+		return IDToken{}, errors.Wrap(err, "verify token")
 	}
 	if expected := encodeSHA256(nonce); idToken.Nonce != expected {
 		c.securityf("attempted replay attack? nonce: %s, expected %s", nonce, expected)
-		return session.UserData{}, BadRequestError{errors.New("nonce does not match")}
+		return IDToken{}, BadRequestError{errors.New("nonce does not match")}
 	}
 
 	// Extract claims and perform additional checks.
 	var claims claims
 	if err := idToken.Claims(&claims); err != nil {
-		return session.UserData{}, errors.Wrap(err, "parse claims")
+		return IDToken{}, errors.Wrap(err, "parse claims")
 	}
+	claims.Expires = idToken.Expiry
+	claims.IssuedAt = idToken.IssuedAt
 
 	// NotBefore (nbf) is not used by OpenID Connect, but included by TARA
 	// and MUST be checked separately.
-	nbf := time.Unix(claims.NotBefore, 0)
-	if time.Now().Before(nbf) {
-		return session.UserData{}, errors.Errorf("token is not valid yet: not before %s", nbf)
+	claims.NotBefore = time.Unix(claims.NBF, 0)
+	if time.Now().Before(claims.NotBefore) {
+		return IDToken{}, errors.Errorf("token is not valid yet: not before %s", claims.NotBefore)
 	}
 
 	if len(claims.AMR) != 1 {
-		return session.UserData{}, errors.Errorf("AMR length not 1: %d", len(claims.AMR))
+		return IDToken{}, errors.Errorf("AMR length not 1: %d", len(claims.AMR))
 	}
 	amr := claims.AMR[0]
 	if _, ok := c.amr[amr]; !ok {
 		c.securityf("attempted downgrade attack? AMR: %s, scopes: %s", amr, c.oauth.Scopes)
-		return session.UserData{}, errors.Errorf(
+		return IDToken{}, errors.Errorf(
 			"authentication method %s not allowed", amr)
 	}
-
-	return session.UserData{
-		UserRef: session.UserRef{
-			Provider: session.TARA,
-			UserID:   idToken.Subject,
-		},
-		FirstName: claims.Profile.GivenName,
-		LastName:  claims.Profile.FamilyName,
-	}, nil
+	return claims.IDToken, nil
 }
 
 // ClearCookies implements the tara.Client interface.
