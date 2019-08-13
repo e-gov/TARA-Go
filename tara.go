@@ -14,13 +14,13 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"net/http"
+	"net/url"
 	"time"
 
 	oidc "github.com/coreos/go-oidc"
 	"github.com/pkg/errors"
 	"golang.org/x/oauth2"
 
-	"confutil"
 	"log"
 	"internal/session"
 )
@@ -71,36 +71,36 @@ func (b BadRequestError) Error() string { return "bad request: " + b.Err.Error()
 // Conf contains the configuration values for the TARA authentication client.
 type Conf struct {
 	// Issuer is OpenID Connect Provider's Issuer Identifier.
-	Issuer confutil.URL
+	Issuer string
 
 	// AuthorizationEndpoint, TokenEndpoint, and JWKSURI specify
 	// configuration information for the OpenID Connect Provider.
 	//
 	// If none of these values are specified, then OpenID Connect Discovery
 	// is attempted with the Issuer Identifier to obtain the configuration.
-	AuthorizationEndpoint confutil.URL
-	TokenEndpoint         confutil.URL
-	JWKSURI               confutil.URL
+	AuthorizationEndpoint string
+	TokenEndpoint         string
+	JWKSURI               string
 
-	RedirectionURI   confutil.URL // Redirection URI of the Relying Party.
-	ClientIdentifier string       // Client Identifier of the Relying Party.
-	ClientSecret     string       // Client Secret of the Relying Party.
+	RedirectionURI   string // Redirection URI of the Relying Party.
+	ClientIdentifier string // Client Identifier of the Relying Party.
+	ClientSecret     string // Client Secret of the Relying Party.
 
 	// Scope specifies additional scope values of the authorization
 	// request. For TARA, this enumerates the allowed authentication
 	// methods. Only "idcard", "mid", and "smartid" values are allowed.
 	Scope []string
 
-	// HTTPTimeout specifies the roundtrip timeout in seconds used for
-	// HTTP requests sent to the OpenID Connect Provider. If unset, then
+	// HTTPTimeout specifies the roundtrip timeout used for HTTP requests
+	// sent to the OpenID Connect Provider. If zero, then
 	// DefaultHTTPTimeout is used instead.
-	HTTPTimeout confutil.Seconds `json:"HTTPTimeoutSeconds"`
+	HTTPTimeout time.Duration
 }
 
 func (c Conf) shouldDiscover() bool {
-	return c.AuthorizationEndpoint.URL == nil &&
-		c.TokenEndpoint.URL == nil &&
-		c.JWKSURI.URL == nil
+	return c.AuthorizationEndpoint == "" &&
+		c.TokenEndpoint == "" &&
+		c.JWKSURI == ""
 }
 
 type client struct {
@@ -113,26 +113,34 @@ type client struct {
 
 // NewClient creates a new TARA client from the provided configuration.
 func NewClient(conf Conf) (Client, error) {
-	if conf.Issuer.URL == nil {
+	if conf.Issuer == "" {
 		return nil, errors.New("missing mandatory Issuer")
 	}
-	if conf.RedirectionURI.URL == nil {
+	if conf.RedirectionURI == "" {
 		return nil, errors.New("missing mandatory Redirection URI")
 	}
+	redirectURL, err := url.Parse(conf.RedirectionURI)
+	if err != nil {
+		return nil, errors.Wrap(err, "parse Redirection URI")
+	}
+	timeout := DefaultHTTPTimeout
+	if conf.HTTPTimeout != 0 {
+		timeout = conf.HTTPTimeout
+	}
 	c := &client{
-		cookiePath: conf.RedirectionURI.URL.Path,
+		cookiePath: redirectURL.EscapedPath(),
 		amr:        make(map[string]struct{}),
 		oauth: oauth2.Config{
 			ClientID:     conf.ClientIdentifier,
 			ClientSecret: conf.ClientSecret,
 			Endpoint: oauth2.Endpoint{
-				AuthURL:  conf.AuthorizationEndpoint.Raw,
-				TokenURL: conf.TokenEndpoint.Raw,
+				AuthURL:  conf.AuthorizationEndpoint,
+				TokenURL: conf.TokenEndpoint,
 			},
-			RedirectURL: conf.RedirectionURI.Raw,
+			RedirectURL: conf.RedirectionURI,
 			Scopes:      []string{oidc.ScopeOpenID},
 		},
-		http: &http.Client{Timeout: conf.HTTPTimeout.Or(DefaultHTTPTimeout)},
+		http: &http.Client{Timeout: timeout},
 	}
 	for _, scope := range conf.Scope {
 		switch scope {
@@ -158,7 +166,7 @@ func NewClient(conf Conf) (Client, error) {
 	}
 	if conf.shouldDiscover() {
 		log.Info().WithString("issuer", conf.Issuer).Log(ctx, "discovery")
-		provider, err := oidc.NewProvider(ctx, conf.Issuer.Raw)
+		provider, err := oidc.NewProvider(ctx, conf.Issuer)
 		if err != nil {
 			return nil, errors.Wrap(err, "autoconfigure provider")
 		}
@@ -171,8 +179,8 @@ func NewClient(conf Conf) (Client, error) {
 
 		c.verifier = provider.Verifier(&vconf)
 	} else {
-		keyset := oidc.NewRemoteKeySet(ctx, conf.JWKSURI.Raw)
-		c.verifier = oidc.NewVerifier(conf.Issuer.Raw, keyset, &vconf)
+		keyset := oidc.NewRemoteKeySet(ctx, conf.JWKSURI)
+		c.verifier = oidc.NewVerifier(conf.Issuer, keyset, &vconf)
 	}
 
 	c.oauth.Endpoint.AuthStyle = oauth2.AuthStyleInHeader
