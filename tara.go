@@ -25,14 +25,16 @@ import (
 	"internal/session"
 )
 
-// DefaultHTTPTimeout is the default roundtrip timeout for requests sent to the
-// OpenID Connect Provider.
-const DefaultHTTPTimeout = 15 * time.Second
-
-// Names of cookies used to store OpenID Connect request state and nonce.
 const (
-	stateCookie = "mysystem-tara-state"
-	nonceCookie = "mysystem-tara-nonce"
+	// DefaultHTTPTimeout is the default roundtrip timeout for requests
+	// sent to the OpenID Connect Provider.
+	DefaultHTTPTimeout = 15 * time.Second
+
+	// DefaultStateCookie is the default name of the state cookie.
+	DefaultStateCookie = "tara-state"
+
+	// DefaultNonceCookie is the default name of the nonce cookie.
+	DefaultNonceCookie = "tara-nonce"
 )
 
 // Client is a TARA client.
@@ -95,6 +97,14 @@ type Conf struct {
 	// sent to the OpenID Connect Provider. If zero, then
 	// DefaultHTTPTimeout is used instead.
 	HTTPTimeout time.Duration
+
+	// StateCookie is the name of the state cookie set by this package. If
+	// not specified, then DefaultStateCookie is used.
+	StateCookie string
+
+	// NonceCookie is the name of the nonce cookie set by this package. If
+	// not specified, then DefaultNonceCookie is used.
+	NonceCookie string
 }
 
 func (c Conf) shouldDiscover() bool {
@@ -103,7 +113,29 @@ func (c Conf) shouldDiscover() bool {
 		c.JWKSURI == ""
 }
 
+func (c Conf) httpTimeout() time.Duration {
+	if c.HTTPTimeout != 0 {
+		return c.HTTPTimeout
+	}
+	return DefaultHTTPTimeout
+}
+
+func (c Conf) stateCookie() string {
+	if c.StateCookie != "" {
+		return c.StateCookie
+	}
+	return DefaultStateCookie
+}
+
+func (c Conf) nonceCookie() string {
+	if c.NonceCookie != "" {
+		return c.NonceCookie
+	}
+	return DefaultNonceCookie
+}
+
 type client struct {
+	conf       Conf
 	cookiePath string
 	amr        map[string]struct{} // Set of allowed authentication methods.
 	verifier   *oidc.IDTokenVerifier
@@ -123,11 +155,8 @@ func NewClient(conf Conf) (Client, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "parse Redirection URI")
 	}
-	timeout := DefaultHTTPTimeout
-	if conf.HTTPTimeout != 0 {
-		timeout = conf.HTTPTimeout
-	}
 	c := &client{
+		conf:       conf,
 		cookiePath: redirectURL.EscapedPath(),
 		amr:        make(map[string]struct{}),
 		oauth: oauth2.Config{
@@ -140,7 +169,7 @@ func NewClient(conf Conf) (Client, error) {
 			RedirectURL: conf.RedirectionURI,
 			Scopes:      []string{oidc.ScopeOpenID},
 		},
-		http: &http.Client{Timeout: timeout},
+		http: &http.Client{Timeout: conf.httpTimeout()},
 	}
 	for _, scope := range conf.Scope {
 		switch scope {
@@ -196,11 +225,11 @@ func (c *client) addScope(scope, amr string) {
 
 // AuthenticationRequest implements the tara.Client interface.
 func (c *client) AuthenticationRequest(ctx context.Context, w http.ResponseWriter) error {
-	state, err := c.addSecretCookie(w, stateCookie)
+	state, err := c.addSecretCookie(w, c.conf.stateCookie())
 	if err != nil {
 		return errors.WithMessage(err, "create state")
 	}
-	nonce, err := c.addSecretCookie(w, nonceCookie)
+	nonce, err := c.addSecretCookie(w, c.conf.nonceCookie())
 	if err != nil {
 		w.Header().Del("Set-Cookie") // Remove all set cookies: hopefully only state.
 		return errors.WithMessage(err, "create nonce")
@@ -238,7 +267,7 @@ func (c *client) AuthenticationResponse(ctx context.Context, r *http.Request) (s
 	if state == "" {
 		return session.UserData{}, BadRequestError{errors.New("missing state value")}
 	}
-	cookie, err := r.Cookie(stateCookie)
+	cookie, err := r.Cookie(c.conf.stateCookie())
 	if err != nil {
 		return session.UserData{}, BadRequestError{errors.New("missing state cookie")}
 	}
@@ -261,7 +290,7 @@ func (c *client) AuthenticationResponse(ctx context.Context, r *http.Request) (s
 	if code == "" {
 		return session.UserData{}, BadRequestError{errors.New("missing authorization code")}
 	}
-	if cookie, err = r.Cookie(nonceCookie); err != nil {
+	if cookie, err = r.Cookie(c.conf.nonceCookie()); err != nil {
 		return session.UserData{}, BadRequestError{errors.New("missing nonce cookie")}
 	}
 	return c.tokenRequest(ctx, code, cookie.Value)
@@ -349,8 +378,8 @@ func (c *client) tokenRequest(ctx context.Context, code, nonce string) (session.
 
 // ClearCookies implements the tara.Client interface.
 func (c *client) ClearCookies(w http.ResponseWriter) {
-	c.setCookie(w, stateCookie, "", -1)
-	c.setCookie(w, nonceCookie, "", -1)
+	c.setCookie(w, c.conf.stateCookie(), "", -1)
+	c.setCookie(w, c.conf.nonceCookie(), "", -1)
 }
 
 func (c *client) setCookie(w http.ResponseWriter, name, value string, maxage int) {
