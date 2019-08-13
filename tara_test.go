@@ -1,7 +1,6 @@
 package tara
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -28,7 +27,7 @@ var testClient = &client{
 
 func TestClientAuthenticationRequest_TestData_CorrectRedirect(t *testing.T) {
 	rr := httptest.NewRecorder()
-	err := testClient.AuthenticationRequest(context.Background(), rr)
+	err := testClient.AuthenticationRequest(rr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -109,7 +108,7 @@ func TestClientAuthenticationResponse_MissingNonceCookie_ReturnsBadRequestError(
 func testBadRequestError(t *testing.T, query, state, nonce string) {
 	t.Helper()
 	r := testAuthResponse(query, state, nonce)
-	_, err := testClient.AuthenticationResponse(context.Background(), r)
+	_, err := testClient.AuthenticationResponse(r)
 	if err == nil {
 		t.Fatal("unexpected success")
 	}
@@ -123,7 +122,7 @@ func TestClientAuthenticationResponse_AuthenticationError_ReturnsError(t *testin
 		"&error=invalid_scope" +
 		"&error_description=required+scope+not+provided"
 	r := testAuthResponse(query, "state", "nonce")
-	_, err := testClient.AuthenticationResponse(context.Background(), r)
+	_, err := testClient.AuthenticationResponse(r)
 	if err == nil {
 		t.Fatal("unexpected success")
 	}

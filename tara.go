@@ -13,6 +13,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"log"
 	"net/http"
 	"net/url"
 	"time"
@@ -21,7 +22,6 @@ import (
 	"github.com/pkg/errors"
 	"golang.org/x/oauth2"
 
-	"log"
 	"internal/session"
 )
 
@@ -44,7 +44,7 @@ type Client interface {
 	//
 	// If the returned error is non-nil, then Client has not written
 	// anything to w yet: the caller must report (and log) the error.
-	AuthenticationRequest(context.Context, http.ResponseWriter) error
+	AuthenticationRequest(http.ResponseWriter) error
 
 	// AuthenticationResponse handles a response from the authorization
 	// endpoint (via user-agent redirect). If successful, it contacts the
@@ -52,7 +52,7 @@ type Client interface {
 	//
 	// A returned BadRequestError indicates that r was invalid in some way.
 	// Otherwise it was an internal server or TARA error.
-	AuthenticationResponse(context.Context, *http.Request) (session.UserData, error)
+	AuthenticationResponse(*http.Request) (session.UserData, error)
 
 	// ClearCookies tells the user-agent to drop all cookies set by Client.
 	ClearCookies(http.ResponseWriter)
@@ -105,6 +105,15 @@ type Conf struct {
 	// NonceCookie is the name of the nonce cookie set by this package. If
 	// not specified, then DefaultNonceCookie is used.
 	NonceCookie string
+
+	// RequestLogger is an optional logger for client and TARA request
+	// information. If nil, then not logged.
+	RequestLogger *log.Logger
+
+	// SecurityLogger is an optional separate logger for security events.
+	// If nil, then RequestLogger is used. If RequestLogger is also nil,
+	// then not logged.
+	SecurityLogger *log.Logger
 }
 
 func (c Conf) shouldDiscover() bool {
@@ -194,17 +203,15 @@ func NewClient(conf Conf) (Client, error) {
 		},
 	}
 	if conf.shouldDiscover() {
-		log.Info().WithString("issuer", conf.Issuer).Log(ctx, "discovery")
+		c.logf("discovering configuration for issuer %s", conf.Issuer)
 		provider, err := oidc.NewProvider(ctx, conf.Issuer)
 		if err != nil {
 			return nil, errors.Wrap(err, "autoconfigure provider")
 		}
 		c.oauth.Endpoint = provider.Endpoint() // Overwrite empty URLs.
-		log.Info().
-			WithString("authURL", c.oauth.Endpoint.AuthURL).
-			WithString("tokenURL", c.oauth.Endpoint.TokenURL).
-			// No access to the discovered JWKS URL.
-			Log(ctx, "configuration")
+		// No access to the discovered JWKS URL.
+		c.logf("discovered configuration, AuthorizationEndpoint: %s, TokenEndpoint: %s",
+			c.oauth.Endpoint.AuthURL, c.oauth.Endpoint.TokenURL)
 
 		c.verifier = provider.Verifier(&vconf)
 	} else {
@@ -224,7 +231,7 @@ func (c *client) addScope(scope, amr string) {
 }
 
 // AuthenticationRequest implements the tara.Client interface.
-func (c *client) AuthenticationRequest(ctx context.Context, w http.ResponseWriter) error {
+func (c *client) AuthenticationRequest(w http.ResponseWriter) error {
 	state, err := c.addSecretCookie(w, c.conf.stateCookie())
 	if err != nil {
 		return errors.WithMessage(err, "create state")
@@ -236,7 +243,7 @@ func (c *client) AuthenticationRequest(ctx context.Context, w http.ResponseWrite
 	}
 
 	location := c.oauth.AuthCodeURL(encodeSHA256(state), oidc.Nonce(encodeSHA256(nonce)))
-	log.Info().WithString("location", location).Log(ctx, "redirect") // No secret cookies in log.
+	c.logf("redirecting to %s", location) // No secret cookies in log.
 
 	// Manual redirect instead of http.Redirect - original request not
 	// available and HTML body not required.
@@ -256,10 +263,10 @@ func (c *client) addSecretCookie(w http.ResponseWriter, name string) (value stri
 }
 
 // AuthenticationResponse implements the tara.Client interface.
-func (c *client) AuthenticationResponse(ctx context.Context, r *http.Request) (session.UserData, error) {
+func (c *client) AuthenticationResponse(r *http.Request) (session.UserData, error) {
 	// Although this information was likely already logged by HTTPS
 	// filters, log it separately for TARA auditability purposes.
-	log.Info().WithString("host", r.Host).WithString("uri", r.RequestURI).Log(ctx, "redirect")
+	c.logf("received authentication response, host: %s, uri: %s", r.Host, r.RequestURI)
 
 	// Check for forged requests.
 	query := r.URL.Query()
@@ -272,10 +279,7 @@ func (c *client) AuthenticationResponse(ctx context.Context, r *http.Request) (s
 		return session.UserData{}, BadRequestError{errors.New("missing state cookie")}
 	}
 	if expected := encodeSHA256(cookie.Value); state != expected {
-		log.Security.Error().
-			WithString("state", state).
-			WithString("expected", expected).
-			Log(ctx, "attempted_csrf?")
+		c.securityf("attempted CSRF? state: %s, expected: %s", state, expected)
 		return session.UserData{}, BadRequestError{errors.New("state does not match")}
 	}
 
@@ -293,7 +297,7 @@ func (c *client) AuthenticationResponse(ctx context.Context, r *http.Request) (s
 	if cookie, err = r.Cookie(c.conf.nonceCookie()); err != nil {
 		return session.UserData{}, BadRequestError{errors.New("missing nonce cookie")}
 	}
-	return c.tokenRequest(ctx, code, cookie.Value)
+	return c.tokenRequest(code, cookie.Value)
 }
 
 type claims struct {
@@ -306,16 +310,16 @@ type claims struct {
 }
 
 // tokenRequest requests user data from the token endpoint.
-func (c *client) tokenRequest(ctx context.Context, code, nonce string) (session.UserData, error) {
-	ctx = oidc.ClientContext(ctx, c.http)
+func (c *client) tokenRequest(code, nonce string) (session.UserData, error) {
+	ctx := oidc.ClientContext(context.Background(), c.http)
 
 	// Get token.
-	log.Info().WithString("code", code).Log(ctx, "request")
+	c.logf("requesting token with code %s", code)
 	token, err := c.oauth.Exchange(ctx, code)
 	if err != nil {
 		return session.UserData{}, errors.Wrap(err, "token request")
 	}
-	log.Info().WithJSON("token", token).Log(ctx, "response")
+	c.logf("received token: %+v", token)
 
 	// Verify token.
 	if tokenType := token.Type(); tokenType != "Bearer" {
@@ -325,17 +329,14 @@ func (c *client) tokenRequest(ctx context.Context, code, nonce string) (session.
 	if !ok {
 		return session.UserData{}, errors.New("missing id_token")
 	}
-	log.Info().WithJSON("jwt", idTokenJWT).Log(ctx, "id_token")
+	c.logf("identity token: %s", idTokenJWT)
 
 	idToken, err := c.verifier.Verify(ctx, idTokenJWT)
 	if err != nil {
 		return session.UserData{}, errors.Wrap(err, "verify token")
 	}
 	if expected := encodeSHA256(nonce); idToken.Nonce != expected {
-		log.Security.Error().
-			WithString("nonce", idToken.Nonce).
-			WithString("expected", expected).
-			Log(ctx, "attempted_replay?")
+		c.securityf("attempted replay attack? nonce: %s, expected %s", nonce, expected)
 		return session.UserData{}, BadRequestError{errors.New("nonce does not match")}
 	}
 
@@ -356,12 +357,8 @@ func (c *client) tokenRequest(ctx context.Context, code, nonce string) (session.
 		return session.UserData{}, errors.Errorf("AMR length not 1: %d", len(claims.AMR))
 	}
 	amr := claims.AMR[0]
-	log.Info().WithString("method", amr).Log(ctx, "amr")
 	if _, ok := c.amr[amr]; !ok {
-		log.Security.Error().
-			WithString("amr", amr).
-			WithString("scope", c.oauth.Scopes).
-			Log(ctx, "attempted_downgrade?")
+		c.securityf("attempted downgrade attack? AMR: %s, scopes: %s", amr, c.oauth.Scopes)
 		return session.UserData{}, errors.Errorf(
 			"authentication method %s not allowed", amr)
 	}
@@ -391,6 +388,20 @@ func (c *client) setCookie(w http.ResponseWriter, name, value string, maxage int
 		Secure:   true,
 		HttpOnly: true,
 	})
+}
+
+func (c *client) logf(format string, v ...interface{}) {
+	if c.conf.RequestLogger != nil {
+		c.conf.RequestLogger.Printf(format+"\n", v...)
+	}
+}
+
+func (c *client) securityf(format string, v ...interface{}) {
+	if c.conf.SecurityLogger != nil {
+		c.conf.SecurityLogger.Printf(format+"\n", v...)
+	} else {
+		c.logf(format, v...)
+	}
 }
 
 func encodeSHA256(data string) string {
