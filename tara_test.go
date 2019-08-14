@@ -1,7 +1,6 @@
 package tara
 
 import (
-	"context"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -28,7 +27,7 @@ var testClient = &client{
 
 func TestClientAuthenticationRequest_TestData_CorrectRedirect(t *testing.T) {
 	rr := httptest.NewRecorder()
-	err := testClient.AuthenticationRequest(context.Background(), rr)
+	err := testClient.AuthenticationRequest(rr)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,7 +40,7 @@ func TestClientAuthenticationRequest_TestData_CorrectRedirect(t *testing.T) {
 	}
 
 	// Check that the state cookie is set.
-	state, secure, httpOnly := getCookie(resp, stateCookie)
+	state, secure, httpOnly := getCookie(resp, DefaultStateCookie)
 	if state == "" {
 		t.Error("missing state cookie")
 	}
@@ -50,7 +49,7 @@ func TestClientAuthenticationRequest_TestData_CorrectRedirect(t *testing.T) {
 	}
 
 	// Check that the nonce cookie is set.
-	nonce, secure, httpOnly := getCookie(resp, nonceCookie)
+	nonce, secure, httpOnly := getCookie(resp, DefaultNonceCookie)
 	if nonce == "" {
 		t.Error("missing nonce cookie")
 	}
@@ -109,7 +108,7 @@ func TestClientAuthenticationResponse_MissingNonceCookie_ReturnsBadRequestError(
 func testBadRequestError(t *testing.T, query, state, nonce string) {
 	t.Helper()
 	r := testAuthResponse(query, state, nonce)
-	_, err := testClient.AuthenticationResponse(context.Background(), r)
+	_, err := testClient.AuthenticationResponse(r)
 	if err == nil {
 		t.Fatal("unexpected success")
 	}
@@ -123,7 +122,7 @@ func TestClientAuthenticationResponse_AuthenticationError_ReturnsError(t *testin
 		"&error=invalid_scope" +
 		"&error_description=required+scope+not+provided"
 	r := testAuthResponse(query, "state", "nonce")
-	_, err := testClient.AuthenticationResponse(context.Background(), r)
+	_, err := testClient.AuthenticationResponse(r)
 	if err == nil {
 		t.Fatal("unexpected success")
 	}
@@ -135,10 +134,10 @@ func TestClientAuthenticationResponse_AuthenticationError_ReturnsError(t *testin
 func testAuthResponse(query, state, nonce string) *http.Request {
 	r := httptest.NewRequest(http.MethodGet, testClient.oauth.RedirectURL+query, nil)
 	if state != "" {
-		r.AddCookie(&http.Cookie{Name: stateCookie, Value: state})
+		r.AddCookie(&http.Cookie{Name: DefaultStateCookie, Value: state})
 	}
 	if nonce != "" {
-		r.AddCookie(&http.Cookie{Name: nonceCookie, Value: nonce})
+		r.AddCookie(&http.Cookie{Name: DefaultNonceCookie, Value: nonce})
 	}
 	return r
 }

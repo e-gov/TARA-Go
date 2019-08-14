@@ -13,26 +13,26 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
+	"log"
 	"net/http"
+	"net/url"
 	"time"
 
 	oidc "github.com/coreos/go-oidc"
 	"github.com/pkg/errors"
 	"golang.org/x/oauth2"
-
-	"confutil"
-	"log"
-	"internal/session"
 )
 
-// DefaultHTTPTimeout is the default roundtrip timeout for requests sent to the
-// OpenID Connect Provider.
-const DefaultHTTPTimeout = 15 * time.Second
-
-// Names of cookies used to store OpenID Connect request state and nonce.
 const (
-	stateCookie = "mysystem-tara-state"
-	nonceCookie = "mysystem-tara-nonce"
+	// DefaultHTTPTimeout is the default roundtrip timeout for requests
+	// sent to the OpenID Connect Provider.
+	DefaultHTTPTimeout = 15 * time.Second
+
+	// DefaultStateCookie is the default name of the state cookie.
+	DefaultStateCookie = "tara-state"
+
+	// DefaultNonceCookie is the default name of the nonce cookie.
+	DefaultNonceCookie = "tara-nonce"
 )
 
 // Client is a TARA client.
@@ -42,7 +42,7 @@ type Client interface {
 	//
 	// If the returned error is non-nil, then Client has not written
 	// anything to w yet: the caller must report (and log) the error.
-	AuthenticationRequest(context.Context, http.ResponseWriter) error
+	AuthenticationRequest(http.ResponseWriter) error
 
 	// AuthenticationResponse handles a response from the authorization
 	// endpoint (via user-agent redirect). If successful, it contacts the
@@ -50,10 +50,33 @@ type Client interface {
 	//
 	// A returned BadRequestError indicates that r was invalid in some way.
 	// Otherwise it was an internal server or TARA error.
-	AuthenticationResponse(context.Context, *http.Request) (session.UserData, error)
+	AuthenticationResponse(*http.Request) (IDToken, error)
 
 	// ClearCookies tells the user-agent to drop all cookies set by Client.
 	ClearCookies(http.ResponseWriter)
+}
+
+// IDToken contains claims about the authenticated identity.
+type IDToken struct {
+	Identifier string    `json:"jti"`
+	Issuer     string    `json:"iss"`
+	Audience   string    `json:"aud"`
+	Expires    time.Time `json:"-"` // "exp" converted to time.Time.
+	IssuedAt   time.Time `json:"-"` // "iat" converted to time.Time.
+	NotBefore  time.Time `json:"-"` // "nbf" converted to time.Time.
+	Subject    string    `json:"sub"`
+	Profile    struct {
+		DateOfBirth string `json:"date_of_birth"`
+		GivenName   string `json:"given_name"`
+		FamilyName  string `json:"family_name"`
+	} `json:"profile_attributes"`
+	AMR           []string // Authentication Method Reference.
+	State         string
+	Nonce         string
+	ACR           string // Authentication Context Class Reference.
+	AtHash        string `json:"at_hash"`
+	Email         string
+	EmailVerified bool `json:"email_verified"`
 }
 
 // BadRequestError is returned from AuthenticationResponse if the request sent
@@ -71,39 +94,78 @@ func (b BadRequestError) Error() string { return "bad request: " + b.Err.Error()
 // Conf contains the configuration values for the TARA authentication client.
 type Conf struct {
 	// Issuer is OpenID Connect Provider's Issuer Identifier.
-	Issuer confutil.URL
+	Issuer string
 
 	// AuthorizationEndpoint, TokenEndpoint, and JWKSURI specify
 	// configuration information for the OpenID Connect Provider.
 	//
 	// If none of these values are specified, then OpenID Connect Discovery
 	// is attempted with the Issuer Identifier to obtain the configuration.
-	AuthorizationEndpoint confutil.URL
-	TokenEndpoint         confutil.URL
-	JWKSURI               confutil.URL
+	AuthorizationEndpoint string
+	TokenEndpoint         string
+	JWKSURI               string
 
-	RedirectionURI   confutil.URL // Redirection URI of the Relying Party.
-	ClientIdentifier string       // Client Identifier of the Relying Party.
-	ClientSecret     string       // Client Secret of the Relying Party.
+	RedirectionURI   string // Redirection URI of the Relying Party.
+	ClientIdentifier string // Client Identifier of the Relying Party.
+	ClientSecret     string // Client Secret of the Relying Party.
 
 	// Scope specifies additional scope values of the authorization
 	// request. For TARA, this enumerates the allowed authentication
 	// methods. Only "idcard", "mid", and "smartid" values are allowed.
 	Scope []string
 
-	// HTTPTimeout specifies the roundtrip timeout in seconds used for
-	// HTTP requests sent to the OpenID Connect Provider. If unset, then
+	// HTTPTimeout specifies the roundtrip timeout used for HTTP requests
+	// sent to the OpenID Connect Provider. If zero, then
 	// DefaultHTTPTimeout is used instead.
-	HTTPTimeout confutil.Seconds `json:"HTTPTimeoutSeconds"`
+	HTTPTimeout time.Duration
+
+	// StateCookie is the name of the state cookie set by this package. If
+	// not specified, then DefaultStateCookie is used.
+	StateCookie string
+
+	// NonceCookie is the name of the nonce cookie set by this package. If
+	// not specified, then DefaultNonceCookie is used.
+	NonceCookie string
+
+	// RequestLogger is an optional logger for client and TARA request
+	// information. If nil, then not logged.
+	RequestLogger *log.Logger
+
+	// SecurityLogger is an optional separate logger for security events.
+	// If nil, then RequestLogger is used. If RequestLogger is also nil,
+	// then not logged.
+	SecurityLogger *log.Logger
 }
 
 func (c Conf) shouldDiscover() bool {
-	return c.AuthorizationEndpoint.URL == nil &&
-		c.TokenEndpoint.URL == nil &&
-		c.JWKSURI.URL == nil
+	return c.AuthorizationEndpoint == "" &&
+		c.TokenEndpoint == "" &&
+		c.JWKSURI == ""
+}
+
+func (c Conf) httpTimeout() time.Duration {
+	if c.HTTPTimeout != 0 {
+		return c.HTTPTimeout
+	}
+	return DefaultHTTPTimeout
+}
+
+func (c Conf) stateCookie() string {
+	if c.StateCookie != "" {
+		return c.StateCookie
+	}
+	return DefaultStateCookie
+}
+
+func (c Conf) nonceCookie() string {
+	if c.NonceCookie != "" {
+		return c.NonceCookie
+	}
+	return DefaultNonceCookie
 }
 
 type client struct {
+	conf       Conf
 	cookiePath string
 	amr        map[string]struct{} // Set of allowed authentication methods.
 	verifier   *oidc.IDTokenVerifier
@@ -113,26 +175,31 @@ type client struct {
 
 // NewClient creates a new TARA client from the provided configuration.
 func NewClient(conf Conf) (Client, error) {
-	if conf.Issuer.URL == nil {
+	if conf.Issuer == "" {
 		return nil, errors.New("missing mandatory Issuer")
 	}
-	if conf.RedirectionURI.URL == nil {
+	if conf.RedirectionURI == "" {
 		return nil, errors.New("missing mandatory Redirection URI")
 	}
+	redirectURL, err := url.Parse(conf.RedirectionURI)
+	if err != nil {
+		return nil, errors.Wrap(err, "parse Redirection URI")
+	}
 	c := &client{
-		cookiePath: conf.RedirectionURI.URL.Path,
+		conf:       conf,
+		cookiePath: redirectURL.EscapedPath(),
 		amr:        make(map[string]struct{}),
 		oauth: oauth2.Config{
 			ClientID:     conf.ClientIdentifier,
 			ClientSecret: conf.ClientSecret,
 			Endpoint: oauth2.Endpoint{
-				AuthURL:  conf.AuthorizationEndpoint.Raw,
-				TokenURL: conf.TokenEndpoint.Raw,
+				AuthURL:  conf.AuthorizationEndpoint,
+				TokenURL: conf.TokenEndpoint,
 			},
-			RedirectURL: conf.RedirectionURI.Raw,
+			RedirectURL: conf.RedirectionURI,
 			Scopes:      []string{oidc.ScopeOpenID},
 		},
-		http: &http.Client{Timeout: conf.HTTPTimeout.Or(DefaultHTTPTimeout)},
+		http: &http.Client{Timeout: conf.httpTimeout()},
 	}
 	for _, scope := range conf.Scope {
 		switch scope {
@@ -157,22 +224,20 @@ func NewClient(conf Conf) (Client, error) {
 		},
 	}
 	if conf.shouldDiscover() {
-		log.Info().WithString("issuer", conf.Issuer).Log(ctx, "discovery")
-		provider, err := oidc.NewProvider(ctx, conf.Issuer.Raw)
+		c.logf("discovering configuration for issuer %s", conf.Issuer)
+		provider, err := oidc.NewProvider(ctx, conf.Issuer)
 		if err != nil {
 			return nil, errors.Wrap(err, "autoconfigure provider")
 		}
 		c.oauth.Endpoint = provider.Endpoint() // Overwrite empty URLs.
-		log.Info().
-			WithString("authURL", c.oauth.Endpoint.AuthURL).
-			WithString("tokenURL", c.oauth.Endpoint.TokenURL).
-			// No access to the discovered JWKS URL.
-			Log(ctx, "configuration")
+		// No access to the discovered JWKS URL.
+		c.logf("discovered configuration, AuthorizationEndpoint: %s, TokenEndpoint: %s",
+			c.oauth.Endpoint.AuthURL, c.oauth.Endpoint.TokenURL)
 
 		c.verifier = provider.Verifier(&vconf)
 	} else {
-		keyset := oidc.NewRemoteKeySet(ctx, conf.JWKSURI.Raw)
-		c.verifier = oidc.NewVerifier(conf.Issuer.Raw, keyset, &vconf)
+		keyset := oidc.NewRemoteKeySet(ctx, conf.JWKSURI)
+		c.verifier = oidc.NewVerifier(conf.Issuer, keyset, &vconf)
 	}
 
 	c.oauth.Endpoint.AuthStyle = oauth2.AuthStyleInHeader
@@ -187,19 +252,19 @@ func (c *client) addScope(scope, amr string) {
 }
 
 // AuthenticationRequest implements the tara.Client interface.
-func (c *client) AuthenticationRequest(ctx context.Context, w http.ResponseWriter) error {
-	state, err := c.addSecretCookie(w, stateCookie)
+func (c *client) AuthenticationRequest(w http.ResponseWriter) error {
+	state, err := c.addSecretCookie(w, c.conf.stateCookie())
 	if err != nil {
 		return errors.WithMessage(err, "create state")
 	}
-	nonce, err := c.addSecretCookie(w, nonceCookie)
+	nonce, err := c.addSecretCookie(w, c.conf.nonceCookie())
 	if err != nil {
 		w.Header().Del("Set-Cookie") // Remove all set cookies: hopefully only state.
 		return errors.WithMessage(err, "create nonce")
 	}
 
 	location := c.oauth.AuthCodeURL(encodeSHA256(state), oidc.Nonce(encodeSHA256(nonce)))
-	log.Info().WithString("location", location).Log(ctx, "redirect") // No secret cookies in log.
+	c.logf("redirecting to %s", location) // No secret cookies in log.
 
 	// Manual redirect instead of http.Redirect - original request not
 	// available and HTML body not required.
@@ -219,130 +284,110 @@ func (c *client) addSecretCookie(w http.ResponseWriter, name string) (value stri
 }
 
 // AuthenticationResponse implements the tara.Client interface.
-func (c *client) AuthenticationResponse(ctx context.Context, r *http.Request) (session.UserData, error) {
+func (c *client) AuthenticationResponse(r *http.Request) (IDToken, error) {
 	// Although this information was likely already logged by HTTPS
 	// filters, log it separately for TARA auditability purposes.
-	log.Info().WithString("host", r.Host).WithString("uri", r.RequestURI).Log(ctx, "redirect")
+	c.logf("received authentication response, host: %s, uri: %s", r.Host, r.RequestURI)
 
 	// Check for forged requests.
 	query := r.URL.Query()
 	state := query.Get("state")
 	if state == "" {
-		return session.UserData{}, BadRequestError{errors.New("missing state value")}
+		return IDToken{}, BadRequestError{errors.New("missing state value")}
 	}
-	cookie, err := r.Cookie(stateCookie)
+	cookie, err := r.Cookie(c.conf.stateCookie())
 	if err != nil {
-		return session.UserData{}, BadRequestError{errors.New("missing state cookie")}
+		return IDToken{}, BadRequestError{errors.New("missing state cookie")}
 	}
 	if expected := encodeSHA256(cookie.Value); state != expected {
-		log.Security.Error().
-			WithString("state", state).
-			WithString("expected", expected).
-			Log(ctx, "attempted_csrf?")
-		return session.UserData{}, BadRequestError{errors.New("state does not match")}
+		c.securityf("attempted CSRF? state: %s, expected: %s", state, expected)
+		return IDToken{}, BadRequestError{errors.New("state does not match")}
 	}
 
 	// Check for failed authentication.
 	if errorCode := query.Get("error"); errorCode != "" {
-		return session.UserData{}, errors.Errorf("authentication failed (%s): %s",
+		return IDToken{}, errors.Errorf("authentication failed (%s): %s",
 			errorCode, query.Get("error_description"))
 	}
 
 	// Exchange authorization code for token containing user data.
 	code := r.URL.Query().Get("code")
 	if code == "" {
-		return session.UserData{}, BadRequestError{errors.New("missing authorization code")}
+		return IDToken{}, BadRequestError{errors.New("missing authorization code")}
 	}
-	if cookie, err = r.Cookie(nonceCookie); err != nil {
-		return session.UserData{}, BadRequestError{errors.New("missing nonce cookie")}
+	if cookie, err = r.Cookie(c.conf.nonceCookie()); err != nil {
+		return IDToken{}, BadRequestError{errors.New("missing nonce cookie")}
 	}
-	return c.tokenRequest(ctx, code, cookie.Value)
+	return c.tokenRequest(code, cookie.Value)
 }
 
 type claims struct {
-	Profile struct {
-		GivenName  string `json:"given_name"`
-		FamilyName string `json:"family_name"`
-	} `json:"profile_attributes"`
-	AMR       []string `json:"amr"`
-	NotBefore int64    `json:"nbf"`
+	IDToken
+	NBF int64 // Not provided by go-oidc: convert manually.
 }
 
 // tokenRequest requests user data from the token endpoint.
-func (c *client) tokenRequest(ctx context.Context, code, nonce string) (session.UserData, error) {
-	ctx = oidc.ClientContext(ctx, c.http)
+func (c *client) tokenRequest(code, nonce string) (IDToken, error) {
+	ctx := oidc.ClientContext(context.Background(), c.http)
 
 	// Get token.
-	log.Info().WithString("code", code).Log(ctx, "request")
+	c.logf("requesting token with code %s", code)
 	token, err := c.oauth.Exchange(ctx, code)
 	if err != nil {
-		return session.UserData{}, errors.Wrap(err, "token request")
+		return IDToken{}, errors.Wrap(err, "token request")
 	}
-	log.Info().WithJSON("token", token).Log(ctx, "response")
+	c.logf("received token: %+v", token)
 
 	// Verify token.
 	if tokenType := token.Type(); tokenType != "Bearer" {
-		return session.UserData{}, errors.Errorf("unsupported token type: %s", tokenType)
+		return IDToken{}, errors.Errorf("unsupported token type: %s", tokenType)
 	}
 	idTokenJWT, ok := token.Extra("id_token").(string)
 	if !ok {
-		return session.UserData{}, errors.New("missing id_token")
+		return IDToken{}, errors.New("missing id_token")
 	}
-	log.Info().WithJSON("jwt", idTokenJWT).Log(ctx, "id_token")
+	c.logf("identity token: %s", idTokenJWT)
 
 	idToken, err := c.verifier.Verify(ctx, idTokenJWT)
 	if err != nil {
-		return session.UserData{}, errors.Wrap(err, "verify token")
+		return IDToken{}, errors.Wrap(err, "verify token")
 	}
 	if expected := encodeSHA256(nonce); idToken.Nonce != expected {
-		log.Security.Error().
-			WithString("nonce", idToken.Nonce).
-			WithString("expected", expected).
-			Log(ctx, "attempted_replay?")
-		return session.UserData{}, BadRequestError{errors.New("nonce does not match")}
+		c.securityf("attempted replay attack? nonce: %s, expected %s", nonce, expected)
+		return IDToken{}, BadRequestError{errors.New("nonce does not match")}
 	}
 
 	// Extract claims and perform additional checks.
 	var claims claims
 	if err := idToken.Claims(&claims); err != nil {
-		return session.UserData{}, errors.Wrap(err, "parse claims")
+		return IDToken{}, errors.Wrap(err, "parse claims")
 	}
+	claims.Expires = idToken.Expiry
+	claims.IssuedAt = idToken.IssuedAt
 
 	// NotBefore (nbf) is not used by OpenID Connect, but included by TARA
 	// and MUST be checked separately.
-	nbf := time.Unix(claims.NotBefore, 0)
-	if time.Now().Before(nbf) {
-		return session.UserData{}, errors.Errorf("token is not valid yet: not before %s", nbf)
+	claims.NotBefore = time.Unix(claims.NBF, 0)
+	if time.Now().Before(claims.NotBefore) {
+		return IDToken{}, errors.Errorf("token is not valid yet: not before %s", claims.NotBefore)
 	}
 
 	if len(claims.AMR) != 1 {
-		return session.UserData{}, errors.Errorf("AMR length not 1: %d", len(claims.AMR))
+		return IDToken{}, errors.Errorf("AMR length not 1: %d", len(claims.AMR))
 	}
 	amr := claims.AMR[0]
-	log.Info().WithString("method", amr).Log(ctx, "amr")
 	if _, ok := c.amr[amr]; !ok {
-		log.Security.Error().
-			WithString("amr", amr).
-			WithString("scope", c.oauth.Scopes).
-			Log(ctx, "attempted_downgrade?")
-		return session.UserData{}, errors.Errorf(
+		c.securityf("attempted downgrade attack? AMR: %s, scopes: %s", amr, c.oauth.Scopes)
+		return IDToken{}, errors.Errorf(
 			"authentication method %s not allowed", amr)
 	}
-
-	return session.UserData{
-		UserRef: session.UserRef{
-			Provider: session.TARA,
-			UserID:   idToken.Subject,
-		},
-		FirstName: claims.Profile.GivenName,
-		LastName:  claims.Profile.FamilyName,
-	}, nil
+	return claims.IDToken, nil
 }
 
 // ClearCookies implements the tara.Client interface.
 func (c *client) ClearCookies(w http.ResponseWriter) {
-	c.setCookie(w, stateCookie, "", -1)
-	c.setCookie(w, nonceCookie, "", -1)
+	c.setCookie(w, c.conf.stateCookie(), "", -1)
+	c.setCookie(w, c.conf.nonceCookie(), "", -1)
 }
 
 func (c *client) setCookie(w http.ResponseWriter, name, value string, maxage int) {
@@ -354,6 +399,20 @@ func (c *client) setCookie(w http.ResponseWriter, name, value string, maxage int
 		Secure:   true,
 		HttpOnly: true,
 	})
+}
+
+func (c *client) logf(format string, v ...interface{}) {
+	if c.conf.RequestLogger != nil {
+		c.conf.RequestLogger.Printf(format+"\n", v...)
+	}
+}
+
+func (c *client) securityf(format string, v ...interface{}) {
+	if c.conf.SecurityLogger != nil {
+		c.conf.SecurityLogger.Printf(format+"\n", v...)
+	} else {
+		c.logf(format, v...)
+	}
 }
 
 func encodeSHA256(data string) string {
